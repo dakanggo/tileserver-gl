@@ -21,6 +21,11 @@ import {
   getTileUrls,
   getPublicUrl,
   isValidHttpUrl,
+  isValidRemoteUrl,
+  parseAllowedHosts,
+  isHostAllowed,
+  getCandidateHost,
+  getSafeProtocol,
 } from './utils.js';
 
 import { fileURLToPath } from 'url';
@@ -30,9 +35,9 @@ const packageJson = JSON.parse(
 );
 const isLight = packageJson.name.slice(-6) === '-light';
 
-const serve_rendered = (
-  await import(`${!isLight ? `./serve_rendered.js` : `./serve_light.js`}`)
-).serve_rendered;
+const { serve_rendered } = await import(
+  `${!isLight ? `./serve_rendered.js` : `./serve_light.js`}`
+);
 
 /**
  *  Starts the server.
@@ -73,7 +78,7 @@ async function start(opts) {
     configPath = path.resolve(opts.configPath);
     try {
       config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
-    } catch (e) {
+    } catch {
       console.log('ERROR: Config file not found or invalid!');
       console.log('   See README.md for instructions and sample data.');
       process.exit(1);
@@ -106,8 +111,10 @@ async function start(opts) {
   const startupPromises = [];
 
   for (const type of Object.keys(paths)) {
+    // eslint-disable-next-line security/detect-object-injection -- paths[type] constructed from validated config paths
     if (!fs.existsSync(paths[type])) {
       console.error(
+        // eslint-disable-next-line security/detect-object-injection -- type is from Object.keys of paths config
         `The specified path for "${type}" does not exist (${paths[type]}).`,
       );
       process.exit(1);
@@ -122,6 +129,7 @@ async function start(opts) {
    */
   async function getFiles(directory) {
     // Fetch all entries of the directory and attach type information
+
     const dirEntries = await fs.promises.readdir(directory, {
       withFileTypes: true,
     });
@@ -150,10 +158,14 @@ async function start(opts) {
 
   if (options.dataDecorator) {
     try {
-      options.dataDecoratorFunc = require(
-        path.resolve(paths.root, options.dataDecorator),
-      );
-    } catch (e) {}
+      const dataDecoratorPath = path.resolve(paths.root, options.dataDecorator);
+
+      const module = await import(dataDecoratorPath);
+      options.dataDecoratorFunc = module.default;
+    } catch (e) {
+      console.error(`Error loading data decorator: ${e}`);
+      // Intentionally don't set options.dataDecoratorFunc - let it remain undefined
+    }
   }
 
   const data = clone(config.data || {});
@@ -178,13 +190,14 @@ async function start(opts) {
    * @param {object} item - The style configuration object.
    * @param {boolean} allowMoreData - Whether to allow adding more data sources.
    * @param {boolean} reportFonts - Whether to report fonts.
-   * @returns {Promise<void>}
+   * @returns {Promise<boolean>} - Returns true if successful, false otherwise.
    */
   async function addStyle(id, item, allowMoreData, reportFonts) {
     let success = true;
 
     let styleJSON;
     try {
+      // Style files should only be HTTP/HTTPS, not S3
       if (isValidHttpUrl(item.style)) {
         const res = await fetch(item.style);
         if (!res.ok) {
@@ -193,11 +206,13 @@ async function start(opts) {
         styleJSON = await res.json();
       } else {
         const styleFile = path.resolve(options.paths.styles, item.style);
+
         const styleFileData = await fs.promises.readFile(styleFile);
         styleJSON = JSON.parse(styleFileData);
       }
-    } catch (e) {
+    } catch (err) {
       console.log(`Error getting style file "${item.style}"`);
+      console.error(err && err.stack ? err.stack : err);
       return false;
     }
 
@@ -215,16 +230,51 @@ async function start(opts) {
             if (id === styleSourceId) {
               // Style id was found in data ids, return that id
               dataItemId = id;
+              break;
             } else {
-              const fileType = Object.keys(data[id])[0];
-              if (data[id][fileType] === styleSourceId) {
-                // Style id was found in data filename, return the id that filename belong to
+              // eslint-disable-next-line security/detect-object-injection -- id is from Object.keys of data config
+              const sourceData = data[id];
+
+              if (
+                (sourceData.pmtiles && sourceData.pmtiles === styleSourceId) ||
+                (sourceData.mbtiles && sourceData.mbtiles === styleSourceId)
+              ) {
                 dataItemId = id;
+                break;
               }
             }
           }
           if (dataItemId) {
-            // input files exists in the data config, return found id
+            // Data source exists in config, now validate file exists
+            // eslint-disable-next-line security/detect-object-injection -- dataItemId is validated above
+            const dataSource = data[dataItemId];
+            const fileType = dataSource.pmtiles ? 'pmtiles' : 'mbtiles';
+            const fileName = dataSource[fileType];
+
+            // Skip validation for remote URLs
+            if (fileName && !isValidRemoteUrl(fileName)) {
+              const filePath = path.resolve(options.paths[fileType], fileName);
+              try {
+                const stats = fs.statSync(filePath);
+                if (!stats.isFile() || stats.size === 0) {
+                  if (opts.ignoreMissingFiles) {
+                    // File doesn't exist or is empty - return undefined to skip
+                    return undefined;
+                  }
+                  // File missing but flag not set - let it fail later
+                  return dataItemId;
+                }
+              } catch (err) {
+                // File doesn't exist
+                if (opts.ignoreMissingFiles) {
+                  return undefined;
+                }
+                // File missing but flag not set - let it fail later
+                return dataItemId;
+              }
+            }
+
+            // File exists or is remote URL, return the id
             return dataItemId;
           } else {
             if (!allowMoreData) {
@@ -236,12 +286,30 @@ async function start(opts) {
               let id =
                 styleSourceId.substr(0, styleSourceId.lastIndexOf('.')) ||
                 styleSourceId;
-              if (isValidHttpUrl(styleSourceId)) {
+              // PMTiles can be remote URLs (HTTP or S3), generate unique ID for remote sources
+              if (isValidRemoteUrl(styleSourceId)) {
                 id =
                   fnv1a(styleSourceId) + '_' + id.replace(/^.*\/(.*)$/, '$1');
+              } else {
+                try {
+                  const stats = fs.statSync(styleSourceId);
+                  if (!stats.isFile() || stats.size === 0) {
+                    if (opts.ignoreMissingFiles) {
+                      // File doesn't exist or is empty - return undefined to skip
+                      return undefined;
+                    }
+                  }
+                } catch (err) {
+                  // File doesn't exist
+                  if (opts.ignoreMissingFiles) {
+                    return undefined;
+                  }
+                }
               }
+              // eslint-disable-next-line security/detect-object-injection -- id is being checked for existence before modification
               while (data[id]) id += '_'; //if the data source id already exists, add a "_" untill it doesn't
               //Add the new data source to the data array.
+              // eslint-disable-next-line security/detect-object-injection -- id is constructed above to be unique
               data[id] = {
                 [protocol]: styleSourceId,
               };
@@ -252,6 +320,7 @@ async function start(opts) {
         },
         (font) => {
           if (reportFonts) {
+            // eslint-disable-next-line security/detect-object-injection -- font is font name from style
             serving.fonts[font] = true;
           }
         },
@@ -270,38 +339,87 @@ async function start(opts) {
             function dataResolver(styleSourceId) {
               let resolvedFileType;
               let resolvedInputFile;
-              let resolvedSparse = false;
+              let resolvedS3Profile;
+              let resolvedRequestPayer;
+              let resolvedS3Region;
+              let resolvedS3UrlFormat;
+              let resolvedSparse;
+
+              // Debug logging to see what we're trying to match
+              if (opts.verbose >= 3) {
+                console.log(
+                  `[dataResolver] Looking for styleSourceId: ${styleSourceId}`,
+                );
+                console.log(
+                  `[dataResolver] Available data keys: ${Object.keys(data).join(', ')}`,
+                );
+              }
 
               for (const id of Object.keys(data)) {
+                // eslint-disable-next-line security/detect-object-injection -- id is from Object.keys of data config
                 const sourceData = data[id];
                 let currentFileType;
                 let currentInputFileValue;
 
                 // Check for recognized file type keys
-                if (sourceData.hasOwnProperty('pmtiles')) {
+                if (Object.hasOwn(sourceData, 'pmtiles')) {
                   currentFileType = 'pmtiles';
                   currentInputFileValue = sourceData.pmtiles;
-                } else if (sourceData.hasOwnProperty('mbtiles')) {
+                } else if (Object.hasOwn(sourceData, 'mbtiles')) {
                   currentFileType = 'mbtiles';
                   currentInputFileValue = sourceData.mbtiles;
                 }
 
                 if (currentFileType && currentInputFileValue) {
+                  // Debug logging
+                  if (opts.verbose >= 3) {
+                    console.log(
+                      `[dataResolver] Checking id="${id}", file="${currentInputFileValue}"`,
+                    );
+                  }
+
                   // Check if this source matches the styleSourceId
-                  if (
-                    styleSourceId === id ||
-                    styleSourceId === currentInputFileValue
-                  ) {
+                  // Match by ID, by file path, or by base filename
+                  const matchById = styleSourceId === id;
+                  const matchByFile = styleSourceId === currentInputFileValue;
+                  const matchByBasename =
+                    styleSourceId.includes(currentInputFileValue) ||
+                    currentInputFileValue.includes(styleSourceId);
+
+                  if (matchById || matchByFile || matchByBasename) {
+                    if (opts.verbose >= 2) {
+                      console.log(
+                        `[dataResolver] Match found for styleSourceId: ${styleSourceId}. (byId=${matchById}, byFile=${matchByFile}, byBasename=${matchByBasename})`,
+                      );
+                    }
+
                     resolvedFileType = currentFileType;
                     resolvedInputFile = currentInputFileValue;
 
-                    // Get sparse flag specifically from this matching source
-                    // Default to false if 'sparse' key doesn't exist or is falsy in a boolean context
-                    if (sourceData.hasOwnProperty('sparse')) {
-                      resolvedSparse = !!sourceData.sparse; // Ensure boolean
-                    } else {
-                      resolvedSparse = false; // Explicitly set default if not present on item
+                    // Get s3Profile if present
+                    if (Object.hasOwn(sourceData, 's3Profile')) {
+                      resolvedS3Profile = sourceData.s3Profile;
                     }
+
+                    // Get s3UrlFormat if present
+                    if (Object.hasOwn(sourceData, 's3UrlFormat')) {
+                      resolvedS3UrlFormat = sourceData.s3UrlFormat;
+                    }
+
+                    // Get requestPayer if present
+                    if (Object.hasOwn(sourceData, 'requestPayer')) {
+                      resolvedRequestPayer = !!sourceData.requestPayer;
+                    }
+
+                    // Get s3Region if present
+                    if (Object.hasOwn(sourceData, 's3Region')) {
+                      resolvedS3Region = sourceData.s3Region;
+                    }
+
+                    // Get sparse: per-source overrides global, default to true
+                    resolvedSparse =
+                      sourceData.sparse ?? options.sparse ?? true;
+
                     break; // Found our match, exit the outer loop
                   }
                 }
@@ -312,21 +430,37 @@ async function start(opts) {
                 console.warn(
                   `Data source not found for styleSourceId: ${styleSourceId}`,
                 );
+                console.warn(
+                  `Available data sources: ${Object.keys(data)
+                    .map((id) => {
+                      // eslint-disable-next-line security/detect-object-injection
+                      const src = data[id];
+                      return `${id} -> ${src.pmtiles || src.mbtiles || 'unknown'}`;
+                    })
+                    .join(', ')}`,
+                );
                 return {
                   inputFile: undefined,
                   fileType: undefined,
-                  sparse: false,
+                  s3Profile: undefined,
+                  requestPayer: false,
+                  s3Region: undefined,
+                  s3UrlFormat: undefined,
+                  sparse: true,
                 };
               }
 
-              if (!isValidHttpUrl(resolvedInputFile)) {
+              // PMTiles supports remote URLs (HTTP and S3), skip path resolution for those
+              if (!isValidRemoteUrl(resolvedInputFile)) {
                 // Ensure options.paths and options.paths[resolvedFileType] exist before trying to use them
                 if (
                   options &&
                   options.paths &&
+                  // eslint-disable-next-line security/detect-object-injection -- resolvedFileType is either 'pmtiles' or 'mbtiles'
                   options.paths[resolvedFileType]
                 ) {
                   resolvedInputFile = path.resolve(
+                    // eslint-disable-next-line security/detect-object-injection -- resolvedFileType is either 'pmtiles' or 'mbtiles'
                     options.paths[resolvedFileType],
                     resolvedInputFile,
                   );
@@ -340,6 +474,10 @@ async function start(opts) {
               return {
                 inputFile: resolvedInputFile,
                 fileType: resolvedFileType,
+                s3Profile: resolvedS3Profile,
+                requestPayer: resolvedRequestPayer,
+                s3Region: resolvedS3Region,
+                s3UrlFormat: resolvedS3UrlFormat,
                 sparse: resolvedSparse,
               };
             },
@@ -352,30 +490,47 @@ async function start(opts) {
     return success;
   }
 
+  // Collect style loading promises separately
+  const stylePromises = [];
   for (const id of Object.keys(config.styles || {})) {
+    // eslint-disable-next-line security/detect-object-injection -- id is from Object.keys of config.styles
     const item = config.styles[id];
     if (!item.style || item.style.length === 0) {
       console.log(`Missing "style" property for ${id}`);
       continue;
     }
-    startupPromises.push(addStyle(id, item, true, true));
+    stylePromises.push(addStyle(id, item, true, true));
   }
+
+  // Wait for styles to finish loading, then load data sources
+  // This ensures data sources added by styles are included
+  startupPromises.push(
+    Promise.all(stylePromises).then(() => {
+      const dataLoadPromises = [];
+      for (const id of Object.keys(data)) {
+        // eslint-disable-next-line security/detect-object-injection -- id is from Object.keys of data config
+        const item = data[id];
+
+        if (!item.pmtiles && !item.mbtiles) {
+          console.log(
+            `Missing "pmtiles" or "mbtiles" property for ${id} data source`,
+          );
+          continue;
+        }
+
+        dataLoadPromises.push(
+          serve_data.add(options, serving.data, item, id, opts),
+        );
+      }
+      return Promise.all(dataLoadPromises);
+    }),
+  );
+
   startupPromises.push(
     serve_font(options, serving.fonts, opts).then((sub) => {
       app.use('/', sub);
     }),
   );
-  for (const id of Object.keys(data)) {
-    const item = data[id];
-    const fileType = Object.keys(data[id])[0];
-    if (!fileType || !(fileType === 'pmtiles' || fileType === 'mbtiles')) {
-      console.log(
-        `Missing "pmtiles" or "mbtiles" property for ${id} data source`,
-      );
-      continue;
-    }
-    startupPromises.push(serve_data.add(options, serving.data, item, id, opts));
-  }
   if (options.serveAllStyles) {
     fs.readdir(options.paths.styles, { withFileTypes: true }, (err, files) => {
       if (err) {
@@ -419,6 +574,7 @@ async function start(opts) {
    * Handles requests for a list of available styles.
    * @param {object} req - Express request object.
    * @param {object} res - Express response object.
+   * @param {object} next - Express next middleware function.
    * @param {string} [req.query.key] - Optional API key.
    * @returns {void}
    */
@@ -428,6 +584,7 @@ async function start(opts) {
       ? `?key=${encodeURIComponent(req.query.key)}`
       : '';
     for (const id of Object.keys(serving.styles)) {
+      // eslint-disable-next-line security/detect-object-injection -- id is from Object.keys of serving.styles
       const styleJSON = serving.styles[id].styleJSON;
       result.push({
         version: styleJSON.version,
@@ -436,6 +593,7 @@ async function start(opts) {
         url: `${getPublicUrl(
           opts.publicUrl,
           req,
+          opts.allowedHosts,
         )}styles/${id}/style.json${query}`,
       });
     }
@@ -451,7 +609,9 @@ async function start(opts) {
    * @returns {Array} - An array of TileJSON objects.
    */
   function addTileJSONs(arr, req, type, tileSize) {
+    // eslint-disable-next-line security/detect-object-injection -- type is 'rendered' or 'data', validated by caller
     for (const id of Object.keys(serving[type])) {
+      // eslint-disable-next-line security/detect-object-injection -- type is 'rendered' or 'data', id is from Object.keys
       const info = clone(serving[type][id].tileJSON);
       let path = '';
       if (type === 'rendered') {
@@ -469,6 +629,7 @@ async function start(opts) {
         {
           pbf: options.pbfAlias,
         },
+        opts.allowedHosts,
       );
       arr.push(info);
     }
@@ -479,6 +640,7 @@ async function start(opts) {
    * Handles requests for a rendered tilejson endpoint.
    * @param {object} req - Express request object.
    * @param {object} res - Express response object.
+   * @param {object} next - Express next middleware function.
    * @param {string} req.params.tileSize - Optional tile size parameter.
    * @returns {void}
    */
@@ -501,6 +663,7 @@ async function start(opts) {
    * Handles requests for a combined rendered and data tilejson endpoint.
    * @param {object} req - Express request object.
    * @param {object} res - Express response object.
+   * @param {object} next - Express next middleware function.
    * @param {string} req.params.tileSize - Optional tile size parameter.
    * @returns {void}
    */
@@ -526,8 +689,8 @@ async function start(opts) {
    * Serves a Handlebars template.
    * @param {string} urlPath - The URL path to serve the template at
    * @param {string} template - The name of the template file
-   * @param {Function} dataGetter - A function to get data to be passed to the template.
-   *  @returns {void}
+   * @param {(req: object) => object|null} dataGetter - A function to get data to be passed to the template.
+   * @returns {void}
    */
   function serveTemplate(urlPath, template, dataGetter) {
     let templateFile = `${templates}/${template}.tmpl`;
@@ -545,7 +708,7 @@ async function start(opts) {
       const content = fs.readFileSync(templateFile, 'utf-8');
       const compiled = handlebars.compile(content.toString());
       app.get(urlPath, (req, res, next) => {
-        if (opts.verbose) {
+        if (opts.verbose >= 1) {
           console.log(`Serving template at path: ${urlPath}`);
         }
         let data = {};
@@ -565,7 +728,7 @@ async function start(opts) {
             if (template === 'wmts') res.set('Content-Type', 'text/xml');
             return res.status(200).send(compiled(data));
           } else {
-            if (opts.verbose) {
+            if (opts.verbose >= 1) {
               console.log(`Forwarding request for: ${urlPath} to next route`);
             }
             next('route');
@@ -581,15 +744,17 @@ async function start(opts) {
   /**
    * Handles requests for the index page, providing a list of available styles and data.
    * @param {object} req - Express request object.
-   * @param {object} res - Express response object.
-   * @returns {void}
+   * @returns {object|null} Template data object or null
    */
   serveTemplate('/', 'index', (req) => {
     let styles = {};
     for (const id of Object.keys(serving.styles || {})) {
       let style = {
+        // eslint-disable-next-line security/detect-object-injection -- id is from Object.keys of serving.styles
         ...serving.styles[id],
+        // eslint-disable-next-line security/detect-object-injection -- id is from Object.keys of serving.styles
         serving_data: serving.styles[id],
+        // eslint-disable-next-line security/detect-object-injection -- id is from Object.keys of serving.styles
         serving_rendered: serving.rendered[id],
       };
 
@@ -615,15 +780,20 @@ async function start(opts) {
           tileSize,
           style.serving_rendered.tileJSON.format,
           opts.publicUrl,
+          undefined,
+          opts.allowedHosts,
         )[0];
       }
 
+      // eslint-disable-next-line security/detect-object-injection -- id is from Object.keys of serving.styles
       styles[id] = style;
     }
     let datas = {};
     for (const id of Object.keys(serving.data || {})) {
+      // eslint-disable-next-line security/detect-object-injection -- id is from Object.keys of serving.data
       let data = Object.assign({}, serving.data[id]);
 
+      // eslint-disable-next-line security/detect-object-injection -- id is from Object.keys of serving.data
       const { tileJSON } = serving.data[id];
       const { center } = tileJSON;
 
@@ -644,6 +814,7 @@ async function start(opts) {
         {
           pbf: options.pbfAlias,
         },
+        opts.allowedHosts,
       )[0];
 
       data.is_vector = tileJSON.format === 'pbf';
@@ -657,6 +828,11 @@ async function start(opts) {
               req,
               tileJSON.tiles,
               `data/${id}/elevation`,
+              undefined,
+              undefined,
+              opts.publicUrl,
+              undefined,
+              opts.allowedHosts,
             )[0];
           }
           data.is_terrain = true;
@@ -682,6 +858,7 @@ async function start(opts) {
         }
         data.formatted_filesize = `${size.toFixed(2)} ${suffix}`;
       }
+      // eslint-disable-next-line security/detect-object-injection -- id is from Object.keys of serving.data
       datas[id] = data;
     }
     return {
@@ -693,12 +870,11 @@ async function start(opts) {
   /**
    * Handles requests for a map viewer template for a specific style.
    * @param {object} req - Express request object.
-   * @param {object} res - Express response object.
-   * @param {string} req.params.id - ID of the style.
-   * @returns {void}
+   * @returns {object|null} Template data object or null
    */
   serveTemplate('/styles/:id/', 'viewer', (req) => {
     const { id } = req.params;
+    // eslint-disable-next-line security/detect-object-injection -- id is route parameter from URL
     const style = clone(((serving.styles || {})[id] || {}).styleJSON);
 
     if (!style) {
@@ -707,8 +883,11 @@ async function start(opts) {
     return {
       ...style,
       id,
+      // eslint-disable-next-line security/detect-object-injection -- id is route parameter from URL
       name: (serving.styles[id] || serving.rendered[id]).name,
+      // eslint-disable-next-line security/detect-object-injection -- id is route parameter from URL
       serving_data: serving.styles[id],
+      // eslint-disable-next-line security/detect-object-injection -- id is route parameter from URL
       serving_rendered: serving.rendered[id],
     };
   });
@@ -716,19 +895,18 @@ async function start(opts) {
   /**
    * Handles requests for a Web Map Tile Service (WMTS) XML template.
    * @param {object} req - Express request object.
-   * @param {object} res - Express response object.
-   * @param {string} req.params.id - ID of the style.
-   * @returns {void}
+   * @returns {object|null} Template data object or null
    */
   serveTemplate('/styles/:id/wmts.xml', 'wmts', (req) => {
     const { id } = req.params;
+    // eslint-disable-next-line security/detect-object-injection -- id is route parameter from URL
     const wmts = clone((serving.styles || {})[id]);
 
     if (!wmts) {
       return null;
     }
 
-    if (wmts.hasOwnProperty('serve_rendered') && !wmts.serve_rendered) {
+    if (Object.hasOwn(wmts, 'serve_rendered') && !wmts.serve_rendered) {
       return null;
     }
 
@@ -736,16 +914,20 @@ async function start(opts) {
     if (opts.publicUrl) {
       baseUrl = opts.publicUrl;
     } else {
-      baseUrl = `${
-        req.get('X-Forwarded-Protocol')
-          ? req.get('X-Forwarded-Protocol')
-          : req.protocol
-      }://${req.get('host')}/`;
+      const parsedAllowed = parseAllowedHosts(opts.allowedHosts);
+      const candidateHost = getCandidateHost(req);
+      if (!isHostAllowed(candidateHost, parsedAllowed)) {
+        baseUrl = '/';
+      } else {
+        const proto = getSafeProtocol(req);
+        baseUrl = `${proto}://${candidateHost}/`;
+      }
     }
 
     return {
       ...wmts,
       id,
+      // eslint-disable-next-line security/detect-object-injection -- id is route parameter from URL
       name: (serving.styles[id] || serving.rendered[id]).name,
       baseUrl,
     };
@@ -754,13 +936,11 @@ async function start(opts) {
   /**
    * Handles requests for a data view template for a specific data source.
    * @param {object} req - Express request object.
-   * @param {object} res - Express response object.
-   * @param {string} req.params.id - ID of the data source.
-   * @param {string} [req.params.view] - Optional view type.
-   * @returns {void}
+   * @returns {object|null} Template data object or null
    */
   serveTemplate('/data{/:view}/:id/', 'data', (req) => {
     const { id, view } = req.params;
+    // eslint-disable-next-line security/detect-object-injection -- id is route parameter from URL
     const data = serving.data[id];
 
     if (!data) {
@@ -806,13 +986,39 @@ async function start(opts) {
     process.env.PORT || opts.port,
     process.env.BIND || opts.bind,
     function () {
-      let address = this.address().address;
+      const addressInfo = this.address();
+
+      if (!addressInfo) {
+        console.error('Failed to bind to port');
+        return;
+      }
+
+      let address = addressInfo.address;
       if (address.indexOf('::') === 0) {
         address = `[${address}]`; // literal IPv6 address
       }
-      console.log(`Listening at http://${address}:${this.address().port}/`);
+      console.log(`Listening at http://${address}:${addressInfo.port}/`);
     },
   );
+
+  // Handle server errors
+  server.on('error', (err) => {
+    const port = process.env.PORT || opts.port;
+    if (err.code === 'EADDRINUSE') {
+      console.error(`ERROR: Port ${port} is already in use.`);
+      console.error(`Please choose a different port with -p or --port option.`);
+      process.exit(1);
+    } else if (err.code === 'EACCES') {
+      console.error(`ERROR: Permission denied to bind to port ${port}.`);
+      console.error(
+        `Try using a port number above 1024 or run with appropriate permissions.`,
+      );
+      process.exit(1);
+    } else {
+      console.error('Server error:', err.message);
+      process.exit(1);
+    }
+  });
 
   // add server.shutdown() to gracefully stop serving
   enableShutdown(server);
